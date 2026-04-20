@@ -1,6 +1,6 @@
 # Truth and Falsity in LLM's
 
-Recent publications have successfully extracted cogent 'personas' from large language models, that is, certain components of activation space corresponding to traits in the responses of these models.
+Recent publications have successfully extracted cogent 'personas' from large language models, that is, certain components of activation space corresponding to traits in the responses of these models. The models of interest are Gemma 2 9B, Llama 3.2 8B and Qwen 2.5 7B.
 
 <div align="center">
 
@@ -11,7 +11,7 @@ Recent publications have successfully extracted cogent 'personas' from large lan
 
 </div>
 
-In this repo, I investigate the following questions:
+In this repository, I investigate the following questions:
 
 1) What conception, if any, do language models have of truth and falsity?
 
