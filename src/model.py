@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 
 import torch
 from tqdm import tqdm
@@ -74,16 +75,21 @@ def cache_residual_stream(
     batch_size: int = 4,
     save_dir: str = "results/",
     layers: list[int] | None = None,
+    shard_size: int = 256,
 ) -> None:
-    """Cache last-token resid_post activations at each layer.
+    """Cache last-token resid_post activations at each layer, with crash recovery.
 
     For each prompt, runs a forward pass with hooks on `blocks.{i}.hook_resid_post`
-    and saves the activation at the final prompt token. Per-layer tensors are
-    concatenated across prompts and written to `{save_dir}/acts_layer_{i}.pt`
-    with shape (N, d_model).
+    and keeps the activation at the final prompt token.
 
-    Note: For Llama 3.1 8B (32 layers, d_model=4096) at bf16, the full cache for
-    ~3.7k prompts is ~14GB. In Colab, set save_dir to a Google Drive path.
+    Prompts are processed in shards of `shard_size`. Each finished shard is written
+    to `{save_dir}/shards/acts_layer_{l}_shard_{s}.pt`, so re-running after a Colab
+    disconnect skips completed shards and only the in-progress shard is lost. Once
+    all shards are done, per-layer tensors are concatenated into
+    `{save_dir}/acts_layer_{l}.pt` (shape (N, d_model)) and the shard dir is removed.
+
+    For Llama 3.1 8B (32 layers, d_model=4096) the final cache for ~3.4k prompts is
+    ~1.7GB. In Colab, point save_dir at a mounted Google Drive path.
 
     Args:
         model: A HookedTransformer.
@@ -91,23 +97,52 @@ def cache_residual_stream(
         batch_size: Prompts per forward pass.
         save_dir: Output directory (created if missing).
         layers: Subset of layer indices to cache. Defaults to all layers.
+        shard_size: Prompts per checkpointed shard.
     """
     os.makedirs(save_dir, exist_ok=True)
+    shard_dir = os.path.join(save_dir, "shards")
+    os.makedirs(shard_dir, exist_ok=True)
     if layers is None:
         layers = list(range(model.cfg.n_layers))
     hook_names = [f"blocks.{i}.hook_resid_post" for i in layers]
-    acc: dict[int, list[torch.Tensor]] = {i: [] for i in layers}
 
-    for i in tqdm(range(0, len(prompts), batch_size), desc="caching"):
-        batch = prompts[i : i + batch_size]
-        # prepend_bos=False because LLAMA_INSTRUCT_TEMPLATE already includes <|begin_of_text|>.
-        tokens = model.to_tokens(batch, prepend_bos=False)
-        _, cache = model.run_with_cache(tokens, names_filter=hook_names)
+    n_shards = (len(prompts) + shard_size - 1) // shard_size
+    for s in range(n_shards):
+        # Resume: a shard counts as done only if every layer file for it exists.
+        if all(
+            os.path.exists(os.path.join(shard_dir, f"acts_layer_{l}_shard_{s}.pt"))
+            for l in layers
+        ):
+            continue
+
+        shard_prompts = prompts[s * shard_size : (s + 1) * shard_size]
+        shard_acc: dict[int, list[torch.Tensor]] = {l: [] for l in layers}
+        for i in tqdm(
+            range(0, len(shard_prompts), batch_size), desc=f"shard {s + 1}/{n_shards}"
+        ):
+            batch = shard_prompts[i : i + batch_size]
+            # prepend_bos=False: LLAMA_INSTRUCT_TEMPLATE already includes <|begin_of_text|>.
+            tokens = model.to_tokens(batch, prepend_bos=False)
+            _, cache = model.run_with_cache(tokens, names_filter=hook_names)
+            for layer in layers:
+                shard_acc[layer].append(
+                    cache[f"blocks.{layer}.hook_resid_post"][:, -1, :].float().cpu()
+                )
+            del cache
         for layer in layers:
-            acts = cache[f"blocks.{layer}.hook_resid_post"][:, -1, :].float().cpu()
-            acc[layer].append(acts)
-        del cache
+            torch.save(
+                torch.cat(shard_acc[layer], dim=0),
+                os.path.join(shard_dir, f"acts_layer_{layer}_shard_{s}.pt"),
+            )
 
+    # All shards present — merge into one tensor per layer, then drop the shard dir.
     for layer in layers:
-        stacked = torch.cat(acc[layer], dim=0)
-        torch.save(stacked, os.path.join(save_dir, f"acts_layer_{layer}.pt"))
+        parts = [
+            torch.load(
+                os.path.join(shard_dir, f"acts_layer_{layer}_shard_{s}.pt"),
+                map_location="cpu",
+            )
+            for s in range(n_shards)
+        ]
+        torch.save(torch.cat(parts, dim=0), os.path.join(save_dir, f"acts_layer_{layer}.pt"))
+    shutil.rmtree(shard_dir)
