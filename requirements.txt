@@ -1,4 +1,4 @@
-transformer-lens==1.19.*
+transformer-lens>=1.20.0
 torch>=2.1.0
 transformers>=4.43.0
 scikit-learn>=1.4.0
